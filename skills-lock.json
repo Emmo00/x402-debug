@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "frontend-design": {
+      "source": "elliottminns/dreamfox-skills",
+      "sourceType": "github",
+      "computedHash": "4cdab125789dfd4e4ba52ac4b4c682558200c6316632d37646099db853ed5f6d"
+    }
+  }
+}
