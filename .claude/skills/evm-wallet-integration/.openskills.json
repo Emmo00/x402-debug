@@ -1,0 +1,7 @@
+{
+  "source": "celo-org/agent-skills",
+  "sourceType": "git",
+  "repoUrl": "https://github.com/celo-org/agent-skills",
+  "subpath": "skills\\evm-wallet-integration",
+  "installedAt": "2026-04-17T11:14:50.124Z"
+}
