@@ -22,11 +22,14 @@ type DecodedPayment = {
   chain: string;
   chainId: string;
   nonce: string;
+  nonceMode: "request" | "authorization";
+  primaryType: string;
   expiration: string;
   domain: string;
   metadata: string;
   facilitator: string;
   warnings: string[];
+  notes: string[];
   unknownFields: Array<{ key: string; value: string }>;
 };
 
@@ -82,6 +85,13 @@ type ProxyFetchResponse = {
   headers: Record<string, string>;
   body: string;
   error?: string;
+};
+
+type SigningPreparation = {
+  payload: unknown;
+  generatedNonce?: string;
+  validAfter?: string;
+  validBefore?: string;
 };
 
 declare global {
@@ -290,6 +300,8 @@ function decodePaymentPayload(rawPayload: string): DecodedPayment {
     chain: findField(objects, ["chain", "network", "networkName"]),
     chainId: findField(objects, ["chainId", "chain_id", "networkId"]),
     nonce: findField(objects, ["nonce", "salt", "challengeNonce"]),
+    nonceMode: "request",
+    primaryType: findField(objects, ["primaryType"]),
     expiration: findField(objects, [
       "expiration",
       "expiresAt",
@@ -306,14 +318,36 @@ function decodePaymentPayload(rawPayload: string): DecodedPayment {
       "settler",
     ]),
     warnings: [],
+    notes: [],
     unknownFields: [],
   };
+
+  const normalizedPrimaryType = decoded.primaryType.toLowerCase();
+  const usesAuthorizationNonce =
+    normalizedPrimaryType === "transferwithauthorization" ||
+    normalizedPrimaryType === "receivewithauthorization" ||
+    normalizedPrimaryType === "permit" ||
+    normalizedPrimaryType === "permit2";
+
+  if (usesAuthorizationNonce) {
+    decoded.nonceMode = "authorization";
+    if (!decoded.nonce) {
+      decoded.nonce = "Generated client-side at signing";
+    }
+
+    decoded.notes.push(
+      "Authorization flow detected: nonce is generated client-side during signing and verified onchain.",
+    );
+  }
 
   const requiredFields = [
     { label: "recipient", value: decoded.recipient },
     { label: "amount", value: decoded.amount },
-    { label: "nonce", value: decoded.nonce },
   ];
+
+  if (decoded.nonceMode === "request") {
+    requiredFields.push({ label: "nonce", value: decoded.nonce });
+  }
 
   for (const field of requiredFields) {
     if (!field.value) {
@@ -380,6 +414,122 @@ function decodePaymentPayload(rawPayload: string): DecodedPayment {
   }
 
   return decoded;
+}
+
+function generateHexNonce(byteLength = 32): string {
+  const buffer = new Uint8Array(byteLength);
+  crypto.getRandomValues(buffer);
+  return `0x${Array.from(buffer, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function applyAuthorizationDefaults(value: unknown, auth: Record<string, string>): unknown {
+  const record = asRecord(value);
+  if (!record) {
+    return value;
+  }
+
+  const output: Record<string, unknown> = { ...record };
+  if (!output.nonce) {
+    output.nonce = auth.nonce;
+  }
+  if (!output.validAfter) {
+    output.validAfter = auth.validAfter;
+  }
+  if (!output.validBefore) {
+    output.validBefore = auth.validBefore;
+  }
+
+  return output;
+}
+
+function buildSigningChallengePayload(challenge: PaymentChallenge): SigningPreparation {
+  const parsed = challenge.decoded.parsed;
+  if (!parsed) {
+    return { payload: challenge.raw };
+  }
+
+  if (challenge.decoded.nonceMode !== "authorization") {
+    return { payload: parsed };
+  }
+
+  const timeoutRaw = challenge.decoded.expiration;
+  const timeoutSeconds = Number(timeoutRaw);
+  const ttlSeconds =
+    Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 && timeoutSeconds < 604800
+      ? Math.floor(timeoutSeconds)
+      : 3600;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const validAfter = nowSeconds.toString();
+  const validBefore = (nowSeconds + ttlSeconds).toString();
+  const nonce = generateHexNonce(32);
+  const authDefaults = {
+    nonce,
+    validAfter,
+    validBefore,
+  };
+
+  const root = applyAuthorizationDefaults(parsed, authDefaults);
+  const rootRecord = asRecord(root);
+  if (!rootRecord) {
+    return {
+      payload: root,
+      generatedNonce: nonce,
+      validAfter,
+      validBefore,
+    };
+  }
+
+  if (Array.isArray(rootRecord.accepts)) {
+    rootRecord.accepts = rootRecord.accepts.map((item) => {
+      const enriched = applyAuthorizationDefaults(item, authDefaults);
+      const enrichedRecord = asRecord(enriched);
+      if (!enrichedRecord) {
+        return enriched;
+      }
+
+      if (enrichedRecord.extra) {
+        enrichedRecord.extra = applyAuthorizationDefaults(enrichedRecord.extra, authDefaults);
+      }
+
+      if (enrichedRecord.message) {
+        enrichedRecord.message = applyAuthorizationDefaults(
+          enrichedRecord.message,
+          authDefaults,
+        );
+      }
+
+      if (enrichedRecord.authorization) {
+        enrichedRecord.authorization = applyAuthorizationDefaults(
+          enrichedRecord.authorization,
+          authDefaults,
+        );
+      }
+
+      return enrichedRecord;
+    });
+  }
+
+  if (rootRecord.extra) {
+    rootRecord.extra = applyAuthorizationDefaults(rootRecord.extra, authDefaults);
+  }
+
+  if (rootRecord.message) {
+    rootRecord.message = applyAuthorizationDefaults(rootRecord.message, authDefaults);
+  }
+
+  if (rootRecord.authorization) {
+    rootRecord.authorization = applyAuthorizationDefaults(
+      rootRecord.authorization,
+      authDefaults,
+    );
+  }
+
+  return {
+    payload: rootRecord,
+    generatedNonce: nonce,
+    validAfter,
+    validBefore,
+  };
 }
 
 function getPaymentCandidates(
@@ -555,6 +705,12 @@ export default function Home() {
 
   const [signature, setSignature] = useState("");
   const [paymentHeader, setPaymentHeader] = useState("");
+  const [signedPayloadPreview, setSignedPayloadPreview] = useState<unknown | null>(
+    null,
+  );
+  const [generatedAuthorizationNonce, setGeneratedAuthorizationNonce] = useState("");
+  const [generatedValidAfter, setGeneratedValidAfter] = useState("");
+  const [generatedValidBefore, setGeneratedValidBefore] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isRetrying, setIsRetrying] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -933,9 +1089,16 @@ export default function Home() {
     }
 
     try {
+      const signingPreparation = buildSigningChallengePayload(selectedChallenge.challenge);
+      const signingChallenge = signingPreparation.payload;
+      const messageToSign =
+        typeof signingChallenge === "string"
+          ? signingChallenge
+          : JSON.stringify(signingChallenge);
+
       const signatureValue = (await window.ethereum.request({
         method: "personal_sign",
-        params: [selectedChallenge.challenge.raw, walletState.address],
+        params: [messageToSign, walletState.address],
       })) as string;
 
       const headerPayload = {
@@ -944,8 +1107,7 @@ export default function Home() {
         address: walletState.address,
         chainId: walletState.chainId,
         signature: signatureValue,
-        challenge:
-          selectedChallenge.challenge.decoded.parsed ?? selectedChallenge.challenge.raw,
+        challenge: signingChallenge,
       };
 
       const encodedHeader = window.btoa(
@@ -954,6 +1116,19 @@ export default function Home() {
 
       setSignature(signatureValue);
       setPaymentHeader(encodedHeader);
+      setSignedPayloadPreview(signingChallenge);
+      setGeneratedAuthorizationNonce(signingPreparation.generatedNonce ?? "");
+      setGeneratedValidAfter(signingPreparation.validAfter ?? "");
+      setGeneratedValidBefore(signingPreparation.validBefore ?? "");
+
+      if (selectedChallenge.challenge.decoded.nonceMode === "authorization") {
+        addActivity(
+          "info",
+          "Nonce generated",
+          "Client-side nonce and validity window added to authorization payload before signing.",
+        );
+      }
+
       addActivity("success", "Signature created", "Payment header prepared.");
 
       await sendRequest("retry", {
@@ -973,6 +1148,10 @@ export default function Home() {
     setSelectedChallengeId("");
     setSignature("");
     setPaymentHeader("");
+    setSignedPayloadPreview(null);
+    setGeneratedAuthorizationNonce("");
+    setGeneratedValidAfter("");
+    setGeneratedValidBefore("");
     setRequestBody("");
     setHeaderRows([{ id: createId("header"), key: "", value: "" }]);
     addActivity("info", "Session reset", "Trace and payload state cleared.");
@@ -990,6 +1169,10 @@ export default function Home() {
     setSelectedChallengeId("");
     setSignature("");
     setPaymentHeader("");
+    setSignedPayloadPreview(null);
+    setGeneratedAuthorizationNonce("");
+    setGeneratedValidAfter("");
+    setGeneratedValidBefore("");
     addActivity("info", "Trace cleared", "Attempt history removed.");
   }
 
@@ -1477,8 +1660,14 @@ export default function Home() {
                           <DecodedField
                             label="Nonce"
                             value={selectedChallenge.challenge.decoded.nonce}
-                            onCopy={() =>
-                              void copyText(selectedChallenge.challenge.decoded.nonce, "nonce")
+                            onCopy={
+                              selectedChallenge.challenge.decoded.nonceMode === "request"
+                                ? () =>
+                                    void copyText(
+                                      selectedChallenge.challenge.decoded.nonce,
+                                      "nonce",
+                                    )
+                                : undefined
                             }
                           />
                           <DecodedField
@@ -1514,6 +1703,19 @@ export default function Home() {
                             <ul className="mt-2 space-y-1 text-sm font-semibold">
                               {selectedChallenge.challenge.decoded.warnings.map((warning) => (
                                 <li key={warning}>{warning}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        ) : null}
+
+                        {selectedChallenge.challenge.decoded.notes.length > 0 ? (
+                          <div className="border-2 border-black bg-(--warning) p-3">
+                            <p className="text-xs font-black uppercase tracking-[0.2em]">
+                              Notes
+                            </p>
+                            <ul className="mt-2 space-y-1 text-sm font-semibold">
+                              {selectedChallenge.challenge.decoded.notes.map((note) => (
+                                <li key={note}>{note}</li>
                               ))}
                             </ul>
                           </div>
@@ -1617,6 +1819,10 @@ export default function Home() {
                 onClick={() => {
                   setSignature("");
                   setPaymentHeader("");
+                  setSignedPayloadPreview(null);
+                  setGeneratedAuthorizationNonce("");
+                  setGeneratedValidAfter("");
+                  setGeneratedValidBefore("");
                   addActivity("info", "Signature cancelled", "Cleared current signature state.");
                 }}
               >
@@ -1647,7 +1853,7 @@ export default function Home() {
             </div>
 
             {(signature || paymentHeader) && (
-              <div className="mt-3 grid gap-3 lg:grid-cols-2">
+              <div className="mt-3 grid gap-3 lg:grid-cols-1">
                 <div>
                   <p className="input-label">Generated Signature</p>
                   <pre className="code-brutal mt-2">{signature || "Not signed"}</pre>
@@ -1656,6 +1862,25 @@ export default function Home() {
                   <p className="input-label">Encoded Payment Header</p>
                   <pre className="code-brutal mt-2">{paymentHeader || "Not generated"}</pre>
                 </div>
+                <div>
+                  <p className="input-label">Signed Payload</p>
+                  <pre className="code-brutal mt-2">
+                    {signedPayloadPreview ? prettyJson(signedPayloadPreview) : "Not generated"}
+                  </pre>
+                </div>
+                {(generatedAuthorizationNonce || generatedValidAfter || generatedValidBefore) && (
+                  <div className="grid gap-2 sm:grid-cols-3">
+                    <DecodedField
+                      label="Generated Nonce"
+                      value={generatedAuthorizationNonce}
+                      onCopy={() =>
+                        void copyText(generatedAuthorizationNonce, "generated nonce")
+                      }
+                    />
+                    <DecodedField label="Valid After" value={generatedValidAfter} />
+                    <DecodedField label="Valid Before" value={generatedValidBefore} />
+                  </div>
+                )}
               </div>
             )}
           </section>
