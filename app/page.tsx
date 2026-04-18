@@ -185,12 +185,26 @@ function collectObjects(value: unknown): Record<string, unknown>[] {
     "params",
     "data",
     "requirements",
+    "accepts",
+    "extra",
+    "resource",
   ];
 
   for (const key of nestedKeys) {
-    const nested = asRecord(root[key]);
+    const nestedValue = root[key];
+    const nested = asRecord(nestedValue);
     if (nested) {
       objects.push(nested);
+      continue;
+    }
+
+    if (Array.isArray(nestedValue)) {
+      for (const entry of nestedValue) {
+        const nestedEntry = asRecord(entry);
+        if (nestedEntry) {
+          objects.push(nestedEntry);
+        }
+      }
     }
   }
 
@@ -250,16 +264,39 @@ function decodePaymentPayload(rawPayload: string): DecodedPayment {
   const decoded: DecodedPayment = {
     raw: rawPayload,
     parsed: parsedRecord,
-    recipient: findField(objects, ["recipient", "payTo", "to", "receiver"]),
-    amount: findField(objects, ["amount", "price", "value", "maxAmount"]),
+    recipient: findField(objects, [
+      "recipient",
+      "recipientAddress",
+      "payTo",
+      "to",
+      "receiver",
+    ]),
+    amount: findField(objects, [
+      "amount",
+      "price",
+      "value",
+      "maxAmount",
+      "maxAmountRequired",
+    ]),
     token: findField(objects, ["token", "asset", "currency", "symbol"]),
     chain: findField(objects, ["chain", "network", "networkName"]),
     chainId: findField(objects, ["chainId", "chain_id", "networkId"]),
     nonce: findField(objects, ["nonce", "salt", "challengeNonce"]),
-    expiration: findField(objects, ["expiration", "expiresAt", "expiry", "deadline"]),
+    expiration: findField(objects, [
+      "expiration",
+      "expiresAt",
+      "expiry",
+      "deadline",
+      "maxTimeoutSeconds",
+    ]),
     domain: findField(objects, ["domain", "resource", "resourceUrl", "aud"]),
     metadata: findField(objects, ["metadata", "meta", "description", "memo"]),
-    facilitator: findField(objects, ["facilitator", "settlement", "settler"]),
+    facilitator: findField(objects, [
+      "facilitator",
+      "facilitatorAddress",
+      "settlement",
+      "settler",
+    ]),
     warnings: [],
     unknownFields: [],
   };
@@ -290,10 +327,12 @@ function decodePaymentPayload(rawPayload: string): DecodedPayment {
         "payto",
         "to",
         "receiver",
+        "recipientaddress",
         "amount",
         "price",
         "value",
         "maxamount",
+        "maxamountrequired",
         "token",
         "asset",
         "currency",
@@ -311,6 +350,7 @@ function decodePaymentPayload(rawPayload: string): DecodedPayment {
         "expiresat",
         "expiry",
         "deadline",
+        "maxtimeoutseconds",
         "domain",
         "resource",
         "resourceurl",
@@ -320,6 +360,7 @@ function decodePaymentPayload(rawPayload: string): DecodedPayment {
         "description",
         "memo",
         "facilitator",
+        "facilitatoraddress",
         "settlement",
         "settler",
       ].map((key) => key.toLowerCase()),
@@ -339,16 +380,20 @@ function getPaymentCandidates(
   responseBody: string,
 ): Array<{ source: string; raw: string }> {
   const candidates: Array<{ source: string; raw: string }> = [];
+  const normalizedHeaders = Object.fromEntries(
+    Object.entries(responseHeaders).map(([key, value]) => [key.toLowerCase(), value]),
+  );
+
   const headerNames = [
-    "x-payment-required",
     "payment-required",
+    "x-payment-required",
     "x402-payment",
     "x-payment",
     "www-authenticate",
   ];
 
   for (const headerName of headerNames) {
-    const headerValue = responseHeaders[headerName];
+    const headerValue = normalizedHeaders[headerName];
     if (headerValue) {
       candidates.push({
         source: `Header: ${headerName}`,
@@ -743,6 +788,14 @@ export default function Home() {
           "Payment required challenge received.",
         );
 
+        if (paymentChallenges.length === 0) {
+          addActivity(
+            "warning",
+            "No payment payload found",
+            "402 response received but no payment payload was visible in exposed headers/body. Add Access-Control-Expose-Headers: PAYMENT-REQUIRED on the server or return the challenge in JSON body.",
+          );
+        }
+
         if (!selectedChallengeId && paymentChallenges.length > 0) {
           setSelectedChallengeId(paymentChallenges[0].id);
         }
@@ -921,6 +974,35 @@ export default function Home() {
 
   const canSign = Boolean(selectedChallenge) && walletState.status === "connected";
   const canRetry = Boolean(paymentHeader && signature);
+
+  const paymentInspectorHint = useMemo(() => {
+    if (!latest402 || allChallenges.length > 0) {
+      return "";
+    }
+
+    const visibleHeaderNames = Object.keys(latest402.responseHeaders).map((key) =>
+      key.toLowerCase(),
+    );
+
+    const hasVisiblePaymentHeader = visibleHeaderNames.some((headerName) =>
+      ["payment-required", "x-payment-required", "x402-payment", "x-payment"].includes(
+        headerName,
+      ),
+    );
+
+    const bodyPreview = latest402.responseBody.trim();
+    const bodyLooksEmpty = !bodyPreview || bodyPreview === "{}" || bodyPreview === "null";
+
+    if (!hasVisiblePaymentHeader && bodyLooksEmpty) {
+      return "No payment payload is visible to the browser. The server likely sent PAYMENT-REQUIRED but did not expose it via CORS. Add Access-Control-Expose-Headers: PAYMENT-REQUIRED (and any x402 headers you use), or include the challenge in the JSON response body.";
+    }
+
+    if (!hasVisiblePaymentHeader) {
+      return "402 was received, but no supported payment header was visible. Ensure the challenge is sent in PAYMENT-REQUIRED / X-PAYMENT-REQUIRED / X402-PAYMENT or in the response body.";
+    }
+
+    return "A payment header may be present but was not decoded as expected. Inspect the raw response and verify header value encoding (base64 JSON or JSON).";
+  }, [allChallenges.length, latest402]);
 
   return (
     <div className="mx-auto flex w-full max-w-400 flex-col gap-4 p-4 sm:p-6 lg:p-8">
@@ -1270,7 +1352,24 @@ export default function Home() {
                   </p>
                 </div>
 
-                <div className="grid gap-3 lg:grid-cols-[320px_minmax(0,1fr)]">
+                {allChallenges.length === 0 ? (
+                  <div className="space-y-3 border-2 border-black bg-white p-3">
+                    <p className="text-xs font-black uppercase tracking-[0.2em]">
+                      Payload not detected
+                    </p>
+                    <p className="text-sm font-semibold">
+                      {paymentInspectorHint ||
+                        "No decodable payment payload was found in this 402 response."}
+                    </p>
+                    <pre className="code-brutal">
+                      {prettyJson({
+                        visibleResponseHeaders: Object.keys(latest402.responseHeaders),
+                        responseBody: latest402.responseBody,
+                      })}
+                    </pre>
+                  </div>
+                ) : (
+                  <div className="grid gap-3 lg:grid-cols-[320px_minmax(0,1fr)]">
                   <div className="space-y-2">
                     <h3 className="text-xs font-black uppercase tracking-[0.2em]">
                       Challenges
@@ -1416,6 +1515,7 @@ export default function Home() {
                     )}
                   </div>
                 </div>
+                )}
               </div>
             ) : (
               <EmptyState text="No 402 challenge captured yet." />
