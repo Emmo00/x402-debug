@@ -5,6 +5,16 @@ type ProxyRequestPayload = {
   body?: string;
 };
 
+const ALLOWED_METHODS = new Set([
+  "GET",
+  "POST",
+  "PUT",
+  "PATCH",
+  "DELETE",
+  "HEAD",
+  "OPTIONS",
+]);
+
 function normalizeHeaders(
   headers: Record<string, string> | undefined,
 ): Record<string, string> {
@@ -34,6 +44,19 @@ function validateTargetUrl(rawUrl: string): URL {
   return parsed;
 }
 
+function normalizeMethod(rawMethod: string): string {
+  const normalized = String(rawMethod || "GET").toUpperCase();
+  if (!ALLOWED_METHODS.has(normalized)) {
+    throw new Error(`Unsupported HTTP method: ${normalized}`);
+  }
+
+  return normalized;
+}
+
+function methodCanHaveBody(method: string): boolean {
+  return method !== "GET" && method !== "HEAD";
+}
+
 export async function POST(request: Request): Promise<Response> {
   let payload: ProxyRequestPayload;
 
@@ -43,9 +66,23 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: "Invalid JSON payload." }, { status: 400 });
   }
 
-  const method = String(payload.method || "GET").toUpperCase();
+  let method: string;
+  try {
+    method = normalizeMethod(payload.method || "GET");
+  } catch (error) {
+    return Response.json(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "Invalid HTTP method in proxy payload.",
+      },
+      { status: 400 },
+    );
+  }
+
   const headers = normalizeHeaders(payload.headers);
-  const body = payload.body ?? "";
+  const body = String(payload.body ?? "");
 
   let url: URL;
   try {
@@ -59,13 +96,13 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  const hasBody = method !== "GET" && body.trim().length > 0;
+  const includeBody = methodCanHaveBody(method);
 
   try {
     const upstreamResponse = await fetch(url, {
       method,
       headers,
-      body: hasBody ? body : undefined,
+      body: includeBody ? body : undefined,
     });
 
     const upstreamHeaders: Record<string, string> = {};

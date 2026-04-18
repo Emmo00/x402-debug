@@ -6,6 +6,8 @@ type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 type StepStatus = "idle" | "active" | "done" | "error";
 type EventKind = "info" | "success" | "warning" | "error";
 type PaymentView = "decoded" | "raw";
+type PaymentEncoding = "base64" | "base64url";
+type SignatureMethod = "personal_sign" | "eth_signTypedData_v4";
 
 type HeaderRow = {
   id: string;
@@ -457,6 +459,11 @@ function buildSigningChallengePayload(challenge: PaymentChallenge): SigningPrepa
     return { payload: parsed };
   }
 
+  // Preserve server-issued authorization fields. Some facilitators reject client-mutated nonce values.
+  if (hasAnyDeepKey(parsed, ["nonce"])) {
+    return { payload: parsed };
+  }
+
   const timeoutRaw = challenge.decoded.expiration;
   const timeoutSeconds = Number(timeoutRaw);
   const ttlSeconds =
@@ -686,6 +693,91 @@ function normalizeChainId(value: string): string {
   return value.toLowerCase();
 }
 
+function methodCanHaveBody(method: string): boolean {
+  const normalized = method.toUpperCase();
+  return normalized !== "GET" && normalized !== "HEAD";
+}
+
+function extractHeaderNameFromSource(source: string): string {
+  const prefix = "Header:";
+  if (!source.startsWith(prefix)) {
+    return "";
+  }
+
+  return source.slice(prefix.length).trim();
+}
+
+function hasAnyDeepKey(value: unknown, wantedKeys: string[]): boolean {
+  const wanted = new Set(wantedKeys.map((key) => key.toLowerCase()));
+  const objects = collectObjects(value);
+
+  for (const object of objects) {
+    for (const key of Object.keys(object)) {
+      if (wanted.has(key.toLowerCase())) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function findTypedDataCandidate(value: unknown): Record<string, unknown> | null {
+  for (const object of collectObjects(value)) {
+    const hasTypes = Boolean(object.types && typeof object.types === "object");
+    const hasDomain = Boolean(object.domain && typeof object.domain === "object");
+    const hasMessage = Boolean(object.message && typeof object.message === "object");
+    const hasPrimaryType = typeof object.primaryType === "string";
+
+    if (hasTypes && hasDomain && hasMessage && hasPrimaryType) {
+      return object;
+    }
+  }
+
+  return null;
+}
+
+function encodeUtf8Base64(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  const chunkSize = 0x8000;
+  let binary = "";
+
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+
+  return window.btoa(binary);
+}
+
+function encodePaymentHeaderPayload(
+  value: unknown,
+  encoding: PaymentEncoding,
+): string {
+  const base64 = encodeUtf8Base64(JSON.stringify(value));
+
+  if (encoding === "base64url") {
+    return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+
+  return base64;
+}
+
+function buildPaymentHeaders(
+  encodedHeader: string,
+  preferredHeaderName: string,
+  walletAddress: string,
+): Record<string, string> {
+  const headerName = preferredHeaderName.trim() || "X-PAYMENT";
+
+  return {
+    [headerName]: encodedHeader,
+    "X-PAYMENT": encodedHeader,
+    "PAYMENT-SIGNATURE": encodedHeader,
+    "X-PAYMENT-ADDRESS": walletAddress,
+  };
+}
+
 export default function Home() {
   const [targetUrl, setTargetUrl] = useState("");
   const [method, setMethod] = useState<HttpMethod>("GET");
@@ -700,6 +792,8 @@ export default function Home() {
   const [activityLog, setActivityLog] = useState<ActivityEvent[]>([]);
   const [paymentView, setPaymentView] = useState<PaymentView>("decoded");
   const [selectedChallengeId, setSelectedChallengeId] = useState("");
+  const [preferredPaymentHeader, setPreferredPaymentHeader] = useState("");
+  const [paymentEncoding, setPaymentEncoding] = useState<PaymentEncoding>("base64");
 
   const [walletState, setWalletState] = useState<WalletState>({
     status: "disconnected",
@@ -710,6 +804,7 @@ export default function Home() {
 
   const [signature, setSignature] = useState("");
   const [paymentHeader, setPaymentHeader] = useState("");
+  const [signatureMethod, setSignatureMethod] = useState<SignatureMethod | "">("");
   const [signedPayloadPreview, setSignedPayloadPreview] = useState<unknown | null>(
     null,
   );
@@ -747,6 +842,24 @@ export default function Home() {
 
   const latestAttempt = attempts.at(-1) ?? null;
   const latest402 = [...attempts].reverse().find((attempt) => attempt.is402) ?? null;
+  const inferredPaymentHeader = selectedChallenge
+    ? extractHeaderNameFromSource(selectedChallenge.challenge.source)
+    : "";
+  const effectivePaymentHeader =
+    preferredPaymentHeader.trim() || inferredPaymentHeader || "X-PAYMENT";
+  const retryBaseAttempt = useMemo(() => {
+    if (selectedChallenge) {
+      const selectedAttempt = attempts.find(
+        (attempt) => attempt.attemptNumber === selectedChallenge.attemptNumber,
+      );
+
+      if (selectedAttempt) {
+        return selectedAttempt;
+      }
+    }
+
+    return latest402;
+  }, [attempts, latest402, selectedChallenge]);
 
   const workflowStatus = {
     walletConnected: walletState.status === "connected",
@@ -867,7 +980,13 @@ export default function Home() {
     phase: "initial" | "retry",
     extraHeaders: Record<string, string> = {},
   ) {
-    const urlCandidate = targetUrl.trim();
+    const baseAttempt = phase === "retry" ? retryBaseAttempt : null;
+    const requestMethod = baseAttempt ? baseAttempt.method : method;
+    const urlCandidate = baseAttempt ? baseAttempt.url.trim() : targetUrl.trim();
+    const requestBodyValue = baseAttempt ? baseAttempt.requestBody : requestBody;
+    const baseHeaders = baseAttempt
+      ? { ...baseAttempt.requestHeaders }
+      : mergeHeaders(headerRows);
 
     if (!urlCandidate) {
       addActivity("warning", "Request blocked", "Please enter an endpoint URL.");
@@ -882,12 +1001,14 @@ export default function Home() {
     }
 
     const requestHeaders = {
-      ...mergeHeaders(headerRows),
+      ...baseHeaders,
       ...extraHeaders,
     };
 
-    const hasBody = method !== "GET" && requestBody.trim().length > 0;
-    if (hasBody && !requestHeaders["Content-Type"]) {
+    const canHaveBody = methodCanHaveBody(requestMethod);
+    const normalizedBody = canHaveBody ? requestBodyValue : "";
+
+    if (normalizedBody.trim().length > 0 && !requestHeaders["Content-Type"]) {
       requestHeaders["Content-Type"] = "application/json";
     }
 
@@ -897,7 +1018,9 @@ export default function Home() {
     addActivity(
       "info",
       phase === "initial" ? "Request sent" : "Retry sent",
-      `${method} ${urlCandidate}`,
+      phase === "retry" && baseAttempt
+        ? `Replaying attempt #${baseAttempt.attemptNumber}: ${requestMethod} ${urlCandidate}`
+        : `${requestMethod} ${urlCandidate}`,
     );
 
     if (phase === "initial") {
@@ -914,9 +1037,9 @@ export default function Home() {
         },
         body: JSON.stringify({
           url: urlCandidate,
-          method,
+          method: requestMethod,
           headers: requestHeaders,
-          body: hasBody ? requestBody : "",
+          body: normalizedBody,
         }),
       });
 
@@ -948,10 +1071,10 @@ export default function Home() {
         attemptNumber,
         phase,
         timestamp,
-        method,
+        method: requestMethod,
         url: urlCandidate,
         requestHeaders,
-        requestBody: hasBody ? requestBody : "",
+        requestBody: normalizedBody,
         responseStatus,
         responseStatusText,
         responseHeaders,
@@ -1004,10 +1127,10 @@ export default function Home() {
         attemptNumber,
         phase,
         timestamp,
-        method,
+        method: requestMethod,
         url: urlCandidate,
         requestHeaders,
-        requestBody: hasBody ? requestBody : "",
+        requestBody: normalizedBody,
         responseStatus: null,
         responseStatusText: "",
         responseHeaders: {},
@@ -1096,31 +1219,44 @@ export default function Home() {
     try {
       const signingPreparation = buildSigningChallengePayload(selectedChallenge.challenge);
       const signingChallenge = signingPreparation.payload;
-      const messageToSign =
-        typeof signingChallenge === "string"
-          ? signingChallenge
-          : JSON.stringify(signingChallenge);
+      const typedDataPayload = findTypedDataCandidate(signingChallenge);
 
-      const signatureValue = (await window.ethereum.request({
-        method: "personal_sign",
-        params: [messageToSign, walletState.address],
-      })) as string;
+      let usedSignatureMethod: SignatureMethod = "personal_sign";
+      let signatureValue = "";
+
+      if (typedDataPayload) {
+        usedSignatureMethod = "eth_signTypedData_v4";
+        signatureValue = (await window.ethereum.request({
+          method: "eth_signTypedData_v4",
+          params: [walletState.address, JSON.stringify(typedDataPayload)],
+        })) as string;
+      } else {
+        const messageToSign =
+          typeof signingChallenge === "string"
+            ? signingChallenge
+            : JSON.stringify(signingChallenge);
+
+        signatureValue = (await window.ethereum.request({
+          method: "personal_sign",
+          params: [messageToSign, walletState.address],
+        })) as string;
+      }
 
       const headerPayload = {
         scheme: "x402",
         signedAt: new Date().toISOString(),
         address: walletState.address,
         chainId: walletState.chainId,
+        signatureMethod: usedSignatureMethod,
         signature: signatureValue,
         challenge: signingChallenge,
       };
 
-      const encodedHeader = window.btoa(
-        unescape(encodeURIComponent(JSON.stringify(headerPayload))),
-      );
+      const encodedHeader = encodePaymentHeaderPayload(headerPayload, paymentEncoding);
 
       setSignature(signatureValue);
       setPaymentHeader(encodedHeader);
+      setSignatureMethod(usedSignatureMethod);
       setSignedPayloadPreview(signingChallenge);
       setGeneratedAuthorizationNonce(signingPreparation.generatedNonce ?? "");
       setGeneratedValidAfter(signingPreparation.validAfter ?? "");
@@ -1136,10 +1272,16 @@ export default function Home() {
 
       addActivity("success", "Signature created", "Payment header prepared.");
 
-      await sendRequest("retry", {
-        "X-PAYMENT": encodedHeader,
-        "X-PAYMENT-ADDRESS": walletState.address,
-      });
+      addActivity(
+        "info",
+        "Signature method",
+        `Used ${usedSignatureMethod} (${paymentEncoding} header encoding).`,
+      );
+
+      await sendRequest(
+        "retry",
+        buildPaymentHeaders(encodedHeader, effectivePaymentHeader, walletState.address),
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : "Signing failed";
       addActivity("error", "Signing failed", message);
@@ -1150,8 +1292,11 @@ export default function Home() {
     setAttempts([]);
     setActivityLog([]);
     setSelectedChallengeId("");
+    setPreferredPaymentHeader("");
+    setPaymentEncoding("base64");
     setSignature("");
     setPaymentHeader("");
+    setSignatureMethod("");
     setSignedPayloadPreview(null);
     setGeneratedAuthorizationNonce("");
     setGeneratedValidAfter("");
@@ -1171,8 +1316,10 @@ export default function Home() {
   function clearTraceOnly() {
     setAttempts([]);
     setSelectedChallengeId("");
+    setPreferredPaymentHeader("");
     setSignature("");
     setPaymentHeader("");
+    setSignatureMethod("");
     setSignedPayloadPreview(null);
     setGeneratedAuthorizationNonce("");
     setGeneratedValidAfter("");
@@ -1809,6 +1956,38 @@ export default function Home() {
             </div>
 
             <div className="mt-3 flex flex-wrap gap-2">
+              <div className="grid w-full gap-3 sm:grid-cols-2">
+                <div>
+                  <label htmlFor="payment-header-name" className="input-label">
+                    Payment header name
+                  </label>
+                  <input
+                    id="payment-header-name"
+                    className="input-brutal"
+                    value={preferredPaymentHeader}
+                    onChange={(event) => setPreferredPaymentHeader(event.target.value)}
+                    placeholder={inferredPaymentHeader || "X-PAYMENT"}
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="payment-encoding" className="input-label">
+                    Header encoding
+                  </label>
+                  <select
+                    id="payment-encoding"
+                    className="input-brutal"
+                    value={paymentEncoding}
+                    onChange={(event) =>
+                      setPaymentEncoding(event.target.value as PaymentEncoding)
+                    }
+                  >
+                    <option value="base64">Base64</option>
+                    <option value="base64url">Base64URL</option>
+                  </select>
+                </div>
+              </div>
+
               <button
                 type="button"
                 className="action-button"
@@ -1836,10 +2015,14 @@ export default function Home() {
                 type="button"
                 className="action-button-secondary"
                 onClick={() =>
-                  void sendRequest("retry", {
-                    "X-PAYMENT": paymentHeader,
-                    "X-PAYMENT-ADDRESS": walletState.address,
-                  })
+                  void sendRequest(
+                    "retry",
+                    buildPaymentHeaders(
+                      paymentHeader,
+                      effectivePaymentHeader,
+                      walletState.address,
+                    ),
+                  )
                 }
                 disabled={!canRetry || isRetrying}
               >
@@ -1857,6 +2040,10 @@ export default function Home() {
 
             {(signature || paymentHeader) && (
               <div className="mt-3 grid gap-3 lg:grid-cols-1">
+                <div>
+                  <p className="input-label">Signature Method</p>
+                  <pre className="code-brutal mt-2">{signatureMethod || "Not selected"}</pre>
+                </div>
                 <div>
                   <p className="input-label">Generated Signature</p>
                   <pre className="code-brutal mt-2">{signature || "Not signed"}</pre>
