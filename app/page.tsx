@@ -76,6 +76,14 @@ type ChallengeInContext = {
   challenge: PaymentChallenge;
 };
 
+type ProxyFetchResponse = {
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  body: string;
+  error?: string;
+};
+
 declare global {
   interface Window {
     ethereum?: {
@@ -738,20 +746,33 @@ export default function Home() {
     }
 
     try {
-      const response = await fetch(urlCandidate, {
-        method,
-        headers: requestHeaders,
-        body: hasBody ? requestBody : undefined,
+      const proxyResponse = await fetch("/api/x402-proxy", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          url: urlCandidate,
+          method,
+          headers: requestHeaders,
+          body: hasBody ? requestBody : "",
+        }),
       });
 
-      const responseBody = await response.text();
-      const responseHeaders: Record<string, string> = {};
-      response.headers.forEach((value, key) => {
-        responseHeaders[key] = value;
-      });
+      const proxyData = (await proxyResponse.json()) as ProxyFetchResponse;
+      if (!proxyResponse.ok || proxyData.error) {
+        throw new Error(
+          proxyData.error || `Proxy request failed with status ${proxyResponse.status}.`,
+        );
+      }
+
+      const responseBody = proxyData.body;
+      const responseHeaders = proxyData.headers;
+      const responseStatus = proxyData.status;
+      const responseStatusText = proxyData.statusText;
 
       const paymentChallenges = getPaymentCandidates(
-        response.status,
+        responseStatus,
         responseHeaders,
         responseBody,
       ).map((candidate) => ({
@@ -770,18 +791,18 @@ export default function Home() {
         url: urlCandidate,
         requestHeaders,
         requestBody: hasBody ? requestBody : "",
-        responseStatus: response.status,
-        responseStatusText: response.statusText,
+        responseStatus,
+        responseStatusText,
         responseHeaders,
         responseBody,
-        is402: response.status === 402,
+        is402: responseStatus === 402,
         paymentChallenges,
         errorMessage: "",
       };
 
       setAttempts((previous) => [...previous, attempt]);
 
-      if (response.status === 402) {
+      if (responseStatus === 402) {
         addActivity(
           "warning",
           "402 captured",
@@ -792,26 +813,26 @@ export default function Home() {
           addActivity(
             "warning",
             "No payment payload found",
-            "402 response received but no payment payload was visible in exposed headers/body. Add Access-Control-Expose-Headers: PAYMENT-REQUIRED on the server or return the challenge in JSON body.",
+            "402 response received but no payment payload was found in server-observed headers/body. Ensure PAYMENT-REQUIRED (or x402 header/body fields) is returned by the endpoint.",
           );
         }
 
         if (!selectedChallengeId && paymentChallenges.length > 0) {
           setSelectedChallengeId(paymentChallenges[0].id);
         }
-      } else if (phase === "retry" && response.ok) {
-        addActivity("success", "Final response received", `Status ${response.status}.`);
-      } else if (phase === "retry" && !response.ok) {
+      } else if (phase === "retry" && responseStatus >= 200 && responseStatus < 300) {
+        addActivity("success", "Final response received", `Status ${responseStatus}.`);
+      } else if (phase === "retry") {
         addActivity(
           "error",
           "Retry failed",
-          `Status ${response.status} ${response.statusText}`,
+          `Status ${responseStatus} ${responseStatusText}`,
         );
       } else {
         addActivity(
-          response.ok ? "success" : "warning",
+          responseStatus >= 200 && responseStatus < 300 ? "success" : "warning",
           "Response received",
-          `Status ${response.status} ${response.statusText}`,
+          `Status ${responseStatus} ${responseStatusText}`,
         );
       }
     } catch (error) {
@@ -994,14 +1015,14 @@ export default function Home() {
     const bodyLooksEmpty = !bodyPreview || bodyPreview === "{}" || bodyPreview === "null";
 
     if (!hasVisiblePaymentHeader && bodyLooksEmpty) {
-      return "No payment payload is visible to the browser. The server likely sent PAYMENT-REQUIRED but did not expose it via CORS. Add Access-Control-Expose-Headers: PAYMENT-REQUIRED (and any x402 headers you use), or include the challenge in the JSON response body.";
+      return "No payment payload was found in server-observed headers/body. Ensure the endpoint returns PAYMENT-REQUIRED (or X-PAYMENT-REQUIRED / X402-PAYMENT) or includes challenge data in JSON body.";
     }
 
     if (!hasVisiblePaymentHeader) {
       return "402 was received, but no supported payment header was visible. Ensure the challenge is sent in PAYMENT-REQUIRED / X-PAYMENT-REQUIRED / X402-PAYMENT or in the response body.";
     }
 
-    return "A payment header may be present but was not decoded as expected. Inspect the raw response and verify header value encoding (base64 JSON or JSON).";
+    return "A payment header was found but was not decoded as expected. Inspect the raw response and verify payload encoding (base64 JSON or JSON).";
   }, [allChallenges.length, latest402]);
 
   return (
@@ -1132,6 +1153,10 @@ export default function Home() {
                 {showBodyEditor ? "Hide body" : "Request body"}
               </button>
             </div>
+
+            <p className="text-xs font-semibold uppercase tracking-[0.15em] text-black/70">
+              Transport: server proxy (captures full upstream headers for x402 inspection)
+            </p>
 
             {showHeadersEditor && (
               <div className="space-y-2 border-2 border-black bg-white p-3">
