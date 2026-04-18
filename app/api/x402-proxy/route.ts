@@ -29,6 +29,32 @@ function normalizeHeaders(
   );
 }
 
+function sanitizePaymentRetryHeaders(
+  headers: Record<string, string>,
+): Record<string, string> {
+  const entries = Object.entries(headers);
+  const hasPaymentSignature = entries.some(
+    ([key]) => key.toLowerCase() === "payment-signature",
+  );
+
+  if (!hasPaymentSignature) {
+    return headers;
+  }
+
+  const blockedHeaders = new Set([
+    "payment-required",
+    "x-payment-required",
+    "x402-payment",
+    "x-payment",
+    "x-payment-address",
+    "www-authenticate",
+  ]);
+
+  return Object.fromEntries(
+    entries.filter(([key]) => !blockedHeaders.has(key.toLowerCase())),
+  );
+}
+
 function validateTargetUrl(rawUrl: string): URL {
   let parsed: URL;
   try {
@@ -81,7 +107,7 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  const headers = normalizeHeaders(payload.headers);
+  const headers = sanitizePaymentRetryHeaders(normalizeHeaders(payload.headers));
   const body = String(payload.body ?? "");
 
   let url: URL;

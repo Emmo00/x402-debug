@@ -698,15 +698,6 @@ function methodCanHaveBody(method: string): boolean {
   return normalized !== "GET" && normalized !== "HEAD";
 }
 
-function extractHeaderNameFromSource(source: string): string {
-  const prefix = "Header:";
-  if (!source.startsWith(prefix)) {
-    return "";
-  }
-
-  return source.slice(prefix.length).trim();
-}
-
 function hasAnyDeepKey(value: unknown, wantedKeys: string[]): boolean {
   const wanted = new Set(wantedKeys.map((key) => key.toLowerCase()));
   const objects = collectObjects(value);
@@ -765,17 +756,26 @@ function encodePaymentHeaderPayload(
 
 function buildPaymentHeaders(
   encodedHeader: string,
-  preferredHeaderName: string,
-  walletAddress: string,
 ): Record<string, string> {
-  const headerName = preferredHeaderName.trim() || "X-PAYMENT";
-
   return {
-    [headerName]: encodedHeader,
-    "X-PAYMENT": encodedHeader,
     "PAYMENT-SIGNATURE": encodedHeader,
-    "X-PAYMENT-ADDRESS": walletAddress,
   };
+}
+
+function sanitizeRetryHeaders(headers: Record<string, string>): Record<string, string> {
+  const blockedHeaders = new Set([
+    "payment-required",
+    "x-payment-required",
+    "x402-payment",
+    "x-payment",
+    "payment-signature",
+    "x-payment-address",
+    "www-authenticate",
+  ]);
+
+  return Object.fromEntries(
+    Object.entries(headers).filter(([key]) => !blockedHeaders.has(key.toLowerCase())),
+  );
 }
 
 export default function Home() {
@@ -792,7 +792,6 @@ export default function Home() {
   const [activityLog, setActivityLog] = useState<ActivityEvent[]>([]);
   const [paymentView, setPaymentView] = useState<PaymentView>("decoded");
   const [selectedChallengeId, setSelectedChallengeId] = useState("");
-  const [preferredPaymentHeader, setPreferredPaymentHeader] = useState("");
   const [paymentEncoding, setPaymentEncoding] = useState<PaymentEncoding>("base64");
 
   const [walletState, setWalletState] = useState<WalletState>({
@@ -842,11 +841,6 @@ export default function Home() {
 
   const latestAttempt = attempts.at(-1) ?? null;
   const latest402 = [...attempts].reverse().find((attempt) => attempt.is402) ?? null;
-  const inferredPaymentHeader = selectedChallenge
-    ? extractHeaderNameFromSource(selectedChallenge.challenge.source)
-    : "";
-  const effectivePaymentHeader =
-    preferredPaymentHeader.trim() || inferredPaymentHeader || "X-PAYMENT";
   const retryBaseAttempt = useMemo(() => {
     if (selectedChallenge) {
       const selectedAttempt = attempts.find(
@@ -1001,7 +995,7 @@ export default function Home() {
     }
 
     const requestHeaders = {
-      ...baseHeaders,
+      ...(phase === "retry" ? sanitizeRetryHeaders(baseHeaders) : baseHeaders),
       ...extraHeaders,
     };
 
@@ -1220,11 +1214,20 @@ export default function Home() {
       const signingPreparation = buildSigningChallengePayload(selectedChallenge.challenge);
       const signingChallenge = signingPreparation.payload;
       const typedDataPayload = findTypedDataCandidate(signingChallenge);
+      const challengeDeclaresPrimaryType = Boolean(
+        selectedChallenge.challenge.decoded.primaryType.trim(),
+      );
 
       let usedSignatureMethod: SignatureMethod = "personal_sign";
       let signatureValue = "";
 
-      if (typedDataPayload) {
+      if (challengeDeclaresPrimaryType && !typedDataPayload) {
+        throw new Error(
+          "Challenge declares EIP-712 primaryType but no typed-data payload was found.",
+        );
+      }
+
+      if (typedDataPayload || challengeDeclaresPrimaryType) {
         usedSignatureMethod = "eth_signTypedData_v4";
         signatureValue = (await window.ethereum.request({
           method: "eth_signTypedData_v4",
@@ -1280,7 +1283,7 @@ export default function Home() {
 
       await sendRequest(
         "retry",
-        buildPaymentHeaders(encodedHeader, effectivePaymentHeader, walletState.address),
+        buildPaymentHeaders(encodedHeader),
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : "Signing failed";
@@ -1292,7 +1295,6 @@ export default function Home() {
     setAttempts([]);
     setActivityLog([]);
     setSelectedChallengeId("");
-    setPreferredPaymentHeader("");
     setPaymentEncoding("base64");
     setSignature("");
     setPaymentHeader("");
@@ -1316,7 +1318,6 @@ export default function Home() {
   function clearTraceOnly() {
     setAttempts([]);
     setSelectedChallengeId("");
-    setPreferredPaymentHeader("");
     setSignature("");
     setPaymentHeader("");
     setSignatureMethod("");
@@ -1956,36 +1957,21 @@ export default function Home() {
             </div>
 
             <div className="mt-3 flex flex-wrap gap-2">
-              <div className="grid w-full gap-3 sm:grid-cols-2">
-                <div>
-                  <label htmlFor="payment-header-name" className="input-label">
-                    Payment header name
-                  </label>
-                  <input
-                    id="payment-header-name"
-                    className="input-brutal"
-                    value={preferredPaymentHeader}
-                    onChange={(event) => setPreferredPaymentHeader(event.target.value)}
-                    placeholder={inferredPaymentHeader || "X-PAYMENT"}
-                  />
-                </div>
-
-                <div>
-                  <label htmlFor="payment-encoding" className="input-label">
-                    Header encoding
-                  </label>
-                  <select
-                    id="payment-encoding"
-                    className="input-brutal"
-                    value={paymentEncoding}
-                    onChange={(event) =>
-                      setPaymentEncoding(event.target.value as PaymentEncoding)
-                    }
-                  >
-                    <option value="base64">Base64</option>
-                    <option value="base64url">Base64URL</option>
-                  </select>
-                </div>
+              <div className="w-full">
+                <label htmlFor="payment-encoding" className="input-label">
+                  Header encoding
+                </label>
+                <select
+                  id="payment-encoding"
+                  className="input-brutal"
+                  value={paymentEncoding}
+                  onChange={(event) =>
+                    setPaymentEncoding(event.target.value as PaymentEncoding)
+                  }
+                >
+                  <option value="base64">Base64</option>
+                  <option value="base64url">Base64URL</option>
+                </select>
               </div>
 
               <button
@@ -2015,14 +2001,7 @@ export default function Home() {
                 type="button"
                 className="action-button-secondary"
                 onClick={() =>
-                  void sendRequest(
-                    "retry",
-                    buildPaymentHeaders(
-                      paymentHeader,
-                      effectivePaymentHeader,
-                      walletState.address,
-                    ),
-                  )
+                  void sendRequest("retry", buildPaymentHeaders(paymentHeader))
                 }
                 disabled={!canRetry || isRetrying}
               >
