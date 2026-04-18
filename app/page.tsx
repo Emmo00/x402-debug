@@ -190,39 +190,33 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 function collectObjects(value: unknown): Record<string, unknown>[] {
-  const root = asRecord(value);
-  if (!root) {
-    return [];
-  }
+  const objects: Record<string, unknown>[] = [];
+  const stack: unknown[] = [value];
+  const visited = new Set<object>();
 
-  const objects: Record<string, unknown>[] = [root];
-  const nestedKeys = [
-    "payment",
-    "challenge",
-    "payload",
-    "params",
-    "data",
-    "requirements",
-    "accepts",
-    "extra",
-    "resource",
-  ];
-
-  for (const key of nestedKeys) {
-    const nestedValue = root[key];
-    const nested = asRecord(nestedValue);
-    if (nested) {
-      objects.push(nested);
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current || typeof current !== "object") {
       continue;
     }
 
-    if (Array.isArray(nestedValue)) {
-      for (const entry of nestedValue) {
-        const nestedEntry = asRecord(entry);
-        if (nestedEntry) {
-          objects.push(nestedEntry);
-        }
+    if (Array.isArray(current)) {
+      for (const entry of current) {
+        stack.push(entry);
       }
+      continue;
+    }
+
+    if (visited.has(current)) {
+      continue;
+    }
+    visited.add(current);
+
+    const record = current as Record<string, unknown>;
+    objects.push(record);
+
+    for (const nested of Object.values(record)) {
+      stack.push(nested);
     }
   }
 
@@ -253,11 +247,22 @@ function detectExpirationWarning(expiration: string): string {
 
   const parsedNumber = Number(expiration);
   if (!Number.isNaN(parsedNumber) && Number.isFinite(parsedNumber)) {
-    const asMilliseconds =
-      parsedNumber > 1_000_000_000_000 ? parsedNumber : parsedNumber * 1000;
-    if (Date.now() > asMilliseconds) {
-      return "Payment challenge appears expired.";
+    if (parsedNumber >= 1_000_000_000_000) {
+      if (Date.now() > parsedNumber) {
+        return "Payment challenge appears expired.";
+      }
+      return "";
     }
+
+    if (parsedNumber >= 1_000_000_000) {
+      const asMilliseconds = parsedNumber * 1000;
+      if (Date.now() > asMilliseconds) {
+        return "Payment challenge appears expired.";
+      }
+      return "";
+    }
+
+    // Small numeric values are likely TTL durations (e.g. maxTimeoutSeconds), not epoch timestamps.
     return "";
   }
 
@@ -1133,7 +1138,6 @@ export default function Home() {
 
       await sendRequest("retry", {
         "X-PAYMENT": encodedHeader,
-        "PAYMENT-SIGNATURE": signatureValue,
         "X-PAYMENT-ADDRESS": walletState.address,
       });
     } catch (error) {
@@ -1834,7 +1838,6 @@ export default function Home() {
                 onClick={() =>
                   void sendRequest("retry", {
                     "X-PAYMENT": paymentHeader,
-                    "PAYMENT-SIGNATURE": signature,
                     "X-PAYMENT-ADDRESS": walletState.address,
                   })
                 }
