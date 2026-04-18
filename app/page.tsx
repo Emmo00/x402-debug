@@ -728,6 +728,200 @@ function findTypedDataCandidate(value: unknown): Record<string, unknown> | null 
   return null;
 }
 
+function findFirstAcceptRecord(value: unknown): Record<string, unknown> | null {
+  for (const object of collectObjects(value)) {
+    const accepts = object.accepts;
+    if (!Array.isArray(accepts)) {
+      continue;
+    }
+
+    for (const entry of accepts) {
+      const record = asRecord(entry);
+      if (record) {
+        return record;
+      }
+    }
+  }
+
+  return null;
+}
+
+function parseCaipOrNumericChainId(value: unknown): number | null {
+  const raw = safeString(value).trim();
+  if (!raw) {
+    return null;
+  }
+
+  const caipMatch = raw.match(/^eip155:(\d+)$/i);
+  if (caipMatch) {
+    const parsed = Number(caipMatch[1]);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  if (raw.startsWith("0x")) {
+    const parsed = Number.parseInt(raw, 16);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? Math.trunc(parsed) : null;
+}
+
+function asPositiveIntegerString(value: unknown): string {
+  const raw = safeString(value).trim();
+  if (!raw) {
+    return "";
+  }
+
+  if (/^\d+$/.test(raw)) {
+    return raw;
+  }
+
+  return "";
+}
+
+function asHexBytes32(value: unknown): string {
+  const raw = safeString(value).trim();
+  if (!raw) {
+    return "";
+  }
+
+  if (/^0x[0-9a-fA-F]{64}$/.test(raw)) {
+    return raw.toLowerCase();
+  }
+
+  if (/^[0-9a-fA-F]{64}$/.test(raw)) {
+    return `0x${raw.toLowerCase()}`;
+  }
+
+  return "";
+}
+
+function asAddress(value: unknown): string {
+  const raw = safeString(value).trim();
+  if (/^0x[0-9a-fA-F]{40}$/.test(raw)) {
+    return raw;
+  }
+
+  return "";
+}
+
+function buildTransferWithAuthorizationTypedData(
+  challenge: PaymentChallenge,
+  signingPayload: unknown,
+  walletAddress: string,
+): Record<string, unknown> | null {
+  const primaryType = challenge.decoded.primaryType.trim();
+  if (primaryType.toLowerCase() !== "transferwithauthorization") {
+    return null;
+  }
+
+  const payloadRecord = asRecord(signingPayload);
+  const acceptRecord =
+    (payloadRecord && Array.isArray(payloadRecord.accepts)
+      ? asRecord(payloadRecord.accepts[0])
+      : null) ?? findFirstAcceptRecord(signingPayload);
+
+  const extraRecord =
+    asRecord(acceptRecord?.extra) ??
+    asRecord(payloadRecord?.extra) ??
+    asRecord(payloadRecord?.authorization) ??
+    asRecord(payloadRecord?.message);
+
+  const messageRecord =
+    asRecord(acceptRecord?.message) ??
+    asRecord(payloadRecord?.message) ??
+    asRecord(payloadRecord?.authorization) ??
+    extraRecord;
+
+  const from =
+    asAddress(messageRecord?.from) ||
+    asAddress(extraRecord?.from) ||
+    asAddress(walletAddress);
+  const to =
+    asAddress(messageRecord?.to) ||
+    asAddress(extraRecord?.to) ||
+    asAddress(extraRecord?.recipientAddress) ||
+    asAddress(acceptRecord?.recipientAddress) ||
+    asAddress(challenge.decoded.recipient);
+  const value =
+    asPositiveIntegerString(messageRecord?.value) ||
+    asPositiveIntegerString(messageRecord?.amount) ||
+    asPositiveIntegerString(extraRecord?.value) ||
+    asPositiveIntegerString(extraRecord?.amount) ||
+    asPositiveIntegerString(acceptRecord?.maxAmountRequired) ||
+    asPositiveIntegerString(acceptRecord?.maxAmount) ||
+    asPositiveIntegerString(challenge.decoded.amount);
+  const validAfter =
+    asPositiveIntegerString(messageRecord?.validAfter) ||
+    asPositiveIntegerString(extraRecord?.validAfter);
+  const validBefore =
+    asPositiveIntegerString(messageRecord?.validBefore) ||
+    asPositiveIntegerString(extraRecord?.validBefore);
+  const nonce =
+    asHexBytes32(messageRecord?.nonce) ||
+    asHexBytes32(extraRecord?.nonce) ||
+    asHexBytes32(challenge.decoded.nonce);
+
+  const chainId =
+    parseCaipOrNumericChainId(acceptRecord?.network) ??
+    parseCaipOrNumericChainId(extraRecord?.chainId) ??
+    parseCaipOrNumericChainId(challenge.decoded.chainId || challenge.decoded.chain);
+  const verifyingContract =
+    asAddress(acceptRecord?.asset) ||
+    asAddress(extraRecord?.verifyingContract) ||
+    asAddress(challenge.decoded.token);
+  const domainName = safeString(extraRecord?.name || "USDC") || "USDC";
+  const domainVersion = safeString(extraRecord?.version || "2") || "2";
+
+  if (
+    !from ||
+    !to ||
+    !value ||
+    !validAfter ||
+    !validBefore ||
+    !nonce ||
+    !chainId ||
+    !verifyingContract
+  ) {
+    return null;
+  }
+
+  return {
+    domain: {
+      name: domainName,
+      version: domainVersion,
+      chainId,
+      verifyingContract,
+    },
+    types: {
+      EIP712Domain: [
+        { name: "name", type: "string" },
+        { name: "version", type: "string" },
+        { name: "chainId", type: "uint256" },
+        { name: "verifyingContract", type: "address" },
+      ],
+      TransferWithAuthorization: [
+        { name: "from", type: "address" },
+        { name: "to", type: "address" },
+        { name: "value", type: "uint256" },
+        { name: "validAfter", type: "uint256" },
+        { name: "validBefore", type: "uint256" },
+        { name: "nonce", type: "bytes32" },
+      ],
+    },
+    primaryType: "TransferWithAuthorization",
+    message: {
+      from,
+      to,
+      value,
+      validAfter,
+      validBefore,
+      nonce,
+    },
+  };
+}
+
 function encodeUtf8Base64(value: string): string {
   const bytes = new TextEncoder().encode(value);
   const chunkSize = 0x8000;
@@ -758,7 +952,7 @@ function buildPaymentHeaders(
   encodedHeader: string,
 ): Record<string, string> {
   return {
-    "PAYMENT-SIGNATURE": encodedHeader,
+    "payment-signature": encodedHeader,
   };
 }
 
@@ -1213,10 +1407,16 @@ export default function Home() {
     try {
       const signingPreparation = buildSigningChallengePayload(selectedChallenge.challenge);
       const signingChallenge = signingPreparation.payload;
-      const typedDataPayload = findTypedDataCandidate(signingChallenge);
       const challengeDeclaresPrimaryType = Boolean(
         selectedChallenge.challenge.decoded.primaryType.trim(),
       );
+      const typedDataPayload =
+        findTypedDataCandidate(signingChallenge) ??
+        buildTransferWithAuthorizationTypedData(
+          selectedChallenge.challenge,
+          signingChallenge,
+          walletState.address,
+        );
 
       let usedSignatureMethod: SignatureMethod = "personal_sign";
       let signatureValue = "";
@@ -1260,7 +1460,7 @@ export default function Home() {
       setSignature(signatureValue);
       setPaymentHeader(encodedHeader);
       setSignatureMethod(usedSignatureMethod);
-      setSignedPayloadPreview(signingChallenge);
+      setSignedPayloadPreview(typedDataPayload ?? signingChallenge);
       setGeneratedAuthorizationNonce(signingPreparation.generatedNonce ?? "");
       setGeneratedValidAfter(signingPreparation.validAfter ?? "");
       setGeneratedValidBefore(signingPreparation.validBefore ?? "");
@@ -1280,6 +1480,14 @@ export default function Home() {
         "Signature method",
         `Used ${usedSignatureMethod} (${paymentEncoding} header encoding).`,
       );
+
+      if (challengeDeclaresPrimaryType && typedDataPayload) {
+        addActivity(
+          "info",
+          "EIP-712 payload",
+          "Constructed typed-data payload from challenge fields and signed with eth_signTypedData_v4.",
+        );
+      }
 
       await sendRequest(
         "retry",
